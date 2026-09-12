@@ -1,0 +1,22 @@
+.pio/
+.vscode/
+*.user
+*.tmp
+
+; Local provisioning/configuration material
+secrets/
+config.local.*
+credentials.*
+
+; PlatformIO and build artifacts
+*.bin
+*.elf
+*.map
+
+.vscode/
+.pio/
+.pio-mcp-workspace/
+examples/
+
+context.md
+spec.md
