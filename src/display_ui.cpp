@@ -4,6 +4,7 @@
 
 #include "ST77922.h"
 #include "ST77922_Touch.h"
+#include "latin1_font.h"
 
 namespace {
 
@@ -12,12 +13,14 @@ TFT_eSprite screen(&tft);
 ST77922 display;
 ST77922_TOUCH touch;
 
-// Layout for rotation 0 (320x480); TFT_eSPI font 4 has a 26 px glyph cell.
+// Layout for rotation 0 (320x480). The Latin-1 GFX font replaces TFT_eSPI's
+// built-in font 4, which only contains ASCII 0x20-0x7F and therefore silently
+// drops accented characters such as u-umlaut or sharp-s. Its line advance is
+// exposed as Latin1Font24_YADVANCE by the generated header.
 constexpr int MARGIN = 10;
-constexpr int TEXT_FONT = 4;
 constexpr int TEXT_SIZE = 1;
 
-constexpr int FONT_CELL_H = 26;
+constexpr int FONT_CELL_H = Latin1Font24_YADVANCE;
 constexpr int LINE_SPACING = 2;
 constexpr int STATUS_H = (FONT_CELL_H * TEXT_SIZE + 2 * LINE_SPACING) * 1.2;
 constexpr int LINE_H = FONT_CELL_H * TEXT_SIZE + LINE_SPACING;
@@ -42,10 +45,26 @@ void pushToPanel() {
 // Clears the sprite and restores the font setup shared by every view.
 void resetCanvas() {
   screen.fillSprite(COLOR_BG);
-  screen.setTextFont(TEXT_FONT);
+  screen.setFreeFont(&Latin1Font24);
   screen.setTextSize(TEXT_SIZE);
   screen.setTextColor(COLOR_TEXT);
   screen.setTextDatum(TL_DATUM);
+}
+
+// Returns the advance the renderer adds for a character, read straight from the
+// GFX font table.
+//
+// TFT_eSPI::textWidth() measures the *last* character of a string as
+// (xOffset + width) instead of its xAdvance, and the blank space glyph has
+// neither (it is { bitmapOffset 0, width 0, height 0, xAdvance 7, 0, 0 }).
+// textWidth(" ") therefore reports 0 even though drawString() advances the
+// cursor by xAdvance, so the measurement cannot be used for the word separator.
+int glyphAdvance(char ch) {
+  const GFXglyph *glyphs = (const GFXglyph *)pgm_read_dword(&Latin1Font24.glyph);
+  const int index = static_cast<int>(ch) - pgm_read_word(&Latin1Font24.first);
+  if (index < 0)
+    return 0;
+  return pgm_read_byte(&glyphs[index].xAdvance) * TEXT_SIZE;
 }
 
 // Draws word-wrapped text inside the (x, x + maxWidth) column, stopping before
@@ -53,7 +72,7 @@ void resetCanvas() {
 // text that did not fit.
 int drawWrapped(const String &text, int x, int y, int maxWidth, int maxY) {
   const int len = text.length();
-  const int spaceWidth = screen.textWidth(" ");
+  const int spaceWidth = glyphAdvance(' ');
   int i = 0;
   int curY = y;
   String lastLine;
@@ -76,8 +95,8 @@ int drawWrapped(const String &text, int x, int y, int maxWidth, int maxY) {
       const int gap = line.isEmpty() ? 0 : spaceWidth;
       if (!line.isEmpty() && lineWidth + gap + wordWidth > maxWidth)
         break; // wrap before the word that does not fit
-      if (gap)
-        line += ' ';
+      if (!line.isEmpty())
+        line += ' '; // always keep the separator, whatever the measured advance
       line += word;
       lineWidth += gap + wordWidth;
       i = j;
