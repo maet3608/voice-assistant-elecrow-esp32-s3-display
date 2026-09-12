@@ -230,6 +230,24 @@ es8311_handle_t es8311_create(const i2c_port_t port, const uint16_t dev_addr);
  */
 void es8311_delete(es8311_handle_t dev);
 esp_err_t es8311_codec_init(void);
+
+/**
+ * @brief Set the DAC output level with a dB-linear (logarithmic) taper
+ *
+ * volume_percent selects a position between the level es8311_codec_init() set up
+ * (100) and mute (0); the attenuation from that level grows linearly in dB, up to
+ * range_db at the bottom, so the control behaves like a normal volume knob. The
+ * value is mapped onto the ES8311 DAC_VOLUME register (0x32), which steps in
+ * 0.5 dB with 0xBF = 0 dB. Requires es8311_codec_init() to have been called.
+ *
+ * @param[in] volume_percent Output level (0 ~ 100), 0 mutes the DAC
+ * @param[in] range_db       Total attenuation between 100 % and 0 %
+ * @return
+ *     - ESP_OK success
+ *     - ESP_ERR_INVALID_STATE if the codec has not been initialized
+ *     - Else I2C read/write error
+ */
+esp_err_t es8311_set_output_volume(int volume_percent, float range_db);
 #ifdef __cplusplus
 }
 #endif

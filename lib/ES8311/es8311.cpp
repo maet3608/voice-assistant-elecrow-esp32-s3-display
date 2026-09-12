@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <math.h>
 #include <string.h>
 #include "es8311.h"
 #include "driver/gpio.h"
@@ -442,11 +443,16 @@ es8311_handle_t es8311_create(const i2c_port_t port, const uint16_t dev_addr)
     return (es8311_handle_t) sensor;
 }
 
+/* Handle kept from es8311_codec_init() so the output volume can be changed
+ * later with es8311_set_output_volume(). */
+static es8311_handle_t g_es_handle = NULL;
+
 esp_err_t es8311_codec_init(void)
 {
     /* Initialize es8311 codec */
     es8311_handle_t es_handle = es8311_create(I2C_NUM_0, ES8311_ADDRRES_0);
     ESP_RETURN_ON_FALSE(es_handle, ESP_FAIL, TAG, "es8311 create failed");
+    g_es_handle = es_handle;
     const es8311_clock_config_t es_clk = {
         .mclk_inverted = false,
         .sclk_inverted = false,
@@ -461,4 +467,38 @@ esp_err_t es8311_codec_init(void)
     ESP_RETURN_ON_ERROR(es8311_microphone_config(es_handle, false), TAG, "set es8311 microphone failed");
     ESP_RETURN_ON_ERROR(es8311_microphone_gain_set(es_handle, ES8311_MIC_GAIN_36DB), TAG, "set es8311 microphone gain failed");
     return ESP_OK;
+}
+
+esp_err_t es8311_set_output_volume(int volume_percent, float range_db)
+{
+    if (g_es_handle == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (volume_percent < 0) {
+        volume_percent = 0;
+    } else if (volume_percent > 100) {
+        volume_percent = 100;
+    }
+    if (range_db < 0.0f) {
+        range_db = 0.0f;
+    }
+
+    int reg;
+    if (volume_percent == 0) {
+        reg = 0; /* mute */
+    } else {
+        /* dB-linear ("logarithmic") taper: attenuation from the level the codec
+         * was initialized with grows linearly in dB as the percentage drops.
+         * DAC_VOLUME (REG32) steps in 0.5 dB with 0xBF = 0 dB. */
+        const int ref_reg = (EXAMPLE_VOICE_VOLUME * 256 / 100) - 1;
+        const float atten_db = (1.0f - (float)volume_percent / 100.0f) * range_db;
+        reg = ref_reg - (int)lroundf(atten_db / 0.5f);
+    }
+    if (reg < 0) {
+        reg = 0;
+    } else if (reg > 0xFF) {
+        reg = 0xFF;
+    }
+
+    return es8311_write_reg(g_es_handle, ES8311_DAC_REG32, (uint8_t)reg);
 }
