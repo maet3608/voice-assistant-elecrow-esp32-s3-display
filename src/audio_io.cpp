@@ -13,28 +13,24 @@ namespace {
 I2SStream i2sStream;
 bool ready = false;
 
-// Number of stereo frames read per I2S access.
+// Number of stereo frames moved per I2S access.
 constexpr size_t CHUNK_FRAMES = 256;
+constexpr size_t CHUNK_BYTES = CHUNK_FRAMES * 4; // 2 channels x 2 bytes
+constexpr int DRAIN_BLOCKS = 4;                  // silence pushed after playback
 
-// ---------------------------------------------------------------------------
+int16_t chunk[CHUNK_FRAMES * 2]; // scratch for one readMonoChunk() call
+
 // Reads one chunk of stereo frames, downmixes it to mono and appends it to
 // `pcm`. Returns the RMS of the chunk (0 when nothing could be read).
-// ---------------------------------------------------------------------------
-float readMonoChunk(int16_t *pcm, size_t &samples, size_t maxSamples, int16_t *chunk,
-                    size_t frames) {
-  const size_t bytesRead = i2sStream.readBytes((uint8_t *)chunk, frames * 4);
-  const int nFrames = (int)(bytesRead / 4); // 2 channels x 2 bytes
+float readMonoChunk(int16_t *pcm, size_t &samples, size_t maxSamples) {
+  const size_t bytesRead = i2sStream.readBytes((uint8_t *)chunk, CHUNK_BYTES);
+  const int nFrames = (int)(bytesRead / 4);
   int64_t sumSq = 0;
 
   for (int i = 0; i < nFrames; i++) {
     // Sum both channels so we don't depend on the mono mic's L/R position.
-    int32_t s = (int32_t)chunk[i * 2] + chunk[i * 2 + 1];
-    if (s > 32767)
-      s = 32767;
-    if (s < -32768)
-      s = -32768;
-
-    const int16_t mono = (int16_t)s;
+    const int32_t sum = (int32_t)chunk[i * 2] + chunk[i * 2 + 1];
+    const int16_t mono = (int16_t)constrain(sum, -32768, 32767);
     if (samples < maxSamples)
       pcm[samples++] = mono;
     sumSq += (int64_t)mono * mono;
@@ -64,9 +60,8 @@ bool initAudio() {
   cfg.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
   cfg.buffer_count = 8;
   cfg.buffer_size = 256;
-  // Clear the DMA buffer when the queues run dry: this makes an underrun emit
-  // silence instead of replaying the last audio block, which would otherwise
-  // leave a short buzz on the speaker after playback ends.
+  // Emit silence instead of replaying the last block on underrun, which would
+  // otherwise leave a short buzz on the speaker after playback ends.
   cfg.auto_clear = true;
 
   if (!i2sStream.begin(cfg)) {
@@ -80,7 +75,6 @@ bool initAudio() {
     return false;
   }
 
-  // Apply the configured speaker level (see OUTPUT_VOLUME_PERCENT).
   if (es8311_set_output_volume(OUTPUT_VOLUME_PERCENT, OUTPUT_VOLUME_RANGE_DB) != ESP_OK) {
     Serial.println("ES8311 volume set failed");
     return false;
@@ -90,15 +84,10 @@ bool initAudio() {
   return true;
 }
 
-bool audioReady() {
-  return ready;
-}
-
 size_t recordSpeech(int16_t *pcm, size_t maxSamples) {
   if (!ready || pcm == nullptr || maxSamples == 0)
     return 0;
 
-  int16_t chunk[CHUNK_FRAMES * 2]; // stereo frames
   size_t samples = 0;
   bool speech = false;
   size_t lastVoiceSample = 0;
@@ -109,7 +98,7 @@ size_t recordSpeech(int16_t *pcm, size_t maxSamples) {
   i2sStream.readBytes((uint8_t *)chunk, sizeof(chunk));
 
   while (true) {
-    const float rms = readMonoChunk(pcm, samples, maxSamples, chunk, CHUNK_FRAMES);
+    const float rms = readMonoChunk(pcm, samples, maxSamples);
     if (rms > peakRms)
       peakRms = rms;
     if (rms > VAD_THRESHOLD) {
@@ -147,8 +136,7 @@ size_t playPcmMono(const int16_t *pcm, size_t samples, int srcSampleRate) {
   if (outSamples == 0)
     return 0;
 
-  constexpr size_t OUT_FRAMES = CHUNK_FRAMES;
-  int16_t stereo[OUT_FRAMES * 2];
+  int16_t stereo[CHUNK_FRAMES * 2];
   size_t framesInBlock = 0;
 
   auto flushBlock = [&]() {
@@ -175,15 +163,15 @@ size_t playPcmMono(const int16_t *pcm, size_t samples, int srcSampleRate) {
 
     stereo[framesInBlock * 2] = sample;     // left
     stereo[framesInBlock * 2 + 1] = sample; // right
-    if (++framesInBlock == OUT_FRAMES)
+    if (++framesInBlock == CHUNK_FRAMES)
       flushBlock();
   }
   flushBlock();
 
   // Push the tail of the audio out of the DMA queue and leave silence behind.
   memset(stereo, 0, sizeof(stereo));
-  for (int i = 0; i < 4; i++)
-    i2sStream.write((uint8_t *)stereo, OUT_FRAMES * 4);
+  for (int i = 0; i < DRAIN_BLOCKS; i++)
+    i2sStream.write((uint8_t *)stereo, CHUNK_BYTES);
 
   return samples;
 }

@@ -19,24 +19,18 @@ bool beginRequest(HTTPClient &http, WiFiClientSecure &client, const char *path,
   http.setTimeout(30000);
   http.setReuse(false); // single request: send "Connection: close"
 
-  if (!http.begin(client, OPENAI_HOST, OPENAI_PORT, path, true)) {
-    Serial.printf("TLS connection to %s%s failed\n", OPENAI_HOST, path);
+  if (!http.begin(client, OPENAI_HOST, OPENAI_PORT, path, true))
     return false;
-  }
 
   http.addHeader("Authorization", String("Bearer ") + g_apiKey);
   http.addHeader("Content-Type", contentType);
   return true;
 }
 
-} // namespace
-
-void openaiHttpBegin(const char *apiKey) {
-  g_apiKey = apiKey;
-}
-
-int httpsPostMultipart(const char *path, const char *contentType,
-                       const uint8_t *body, size_t len, String &responseBody) {
+// POSTs `body` and reads the textual response. Shared by the multipart and JSON
+// entry points below; only failures are logged.
+int postAndRead(const char *path, const char *contentType, const uint8_t *body, size_t len,
+                String &responseBody) {
   WiFiClientSecure client;
   HTTPClient http;
   if (!beginRequest(http, client, path, contentType))
@@ -47,29 +41,25 @@ int httpsPostMultipart(const char *path, const char *contentType,
     responseBody = http.getString();
   http.end();
 
-  Serial.printf("--- POST %s -> status %d (%u bytes) ---\n", path, status,
-                (unsigned)responseBody.length());
-  if (status == HTTP_OK_STATUS)
-    Serial.println(responseBody);
+  if (status != HTTP_OK_STATUS)
+    Serial.printf("POST %s failed (%d)\n", path, status);
   return status;
 }
 
+} // namespace
+
+void openaiHttpBegin(const char *apiKey) {
+  g_apiKey = apiKey;
+}
+
+int httpsPostMultipart(const char *path, const char *contentType,
+                       const uint8_t *body, size_t len, String &responseBody) {
+  return postAndRead(path, contentType, body, len, responseBody);
+}
+
 int httpsPostJson(const char *path, const String &payload, String &responseBody) {
-  WiFiClientSecure client;
-  HTTPClient http;
-  if (!beginRequest(http, client, path, "application/json"))
-    return HTTPC_ERROR_CONNECTION_REFUSED;
-
-  const int status = http.POST((uint8_t *)payload.c_str(), payload.length());
-  if (status == HTTP_OK_STATUS)
-    responseBody = http.getString();
-  http.end();
-
-  Serial.printf("--- POST %s -> status %d (%u bytes) ---\n", path, status,
-                (unsigned)responseBody.length());
-  if (status == HTTP_OK_STATUS)
-    Serial.println(responseBody);
-  return status;
+  return postAndRead(path, "application/json", (const uint8_t *)payload.c_str(), payload.length(),
+                     responseBody);
 }
 
 int httpsPostToStream(const char *path, const String &payload, Stream &sink) {
@@ -80,18 +70,14 @@ int httpsPostToStream(const char *path, const String &payload, Stream &sink) {
 
   const int status = http.POST((uint8_t *)payload.c_str(), payload.length());
   int written = -1;
-  if (status == HTTP_OK_STATUS) {
+  if (status == HTTP_OK_STATUS)
     written = http.writeToStream(&sink);
-    if (written < 0)
-      Serial.printf("Binary download failed: %s\n",
-                    HTTPClient::errorToString(written).c_str());
-  } else {
-    // Error responses are JSON, so they are safe to log.
-    Serial.printf("--- POST %s -> status %d ---\n", path, status);
-    Serial.println(http.getString());
-  }
   http.end();
 
-  Serial.printf("--- POST %s -> status %d, %d bytes downloaded ---\n", path, status, written);
+  if (status != HTTP_OK_STATUS)
+    Serial.printf("POST %s failed (%d)\n", path, status);
+  else if (written < 0)
+    Serial.printf("POST %s download failed: %s\n", path,
+                  HTTPClient::errorToString(written).c_str());
   return status;
 }

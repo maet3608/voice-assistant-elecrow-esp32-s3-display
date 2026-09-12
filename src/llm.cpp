@@ -6,8 +6,8 @@
 #include "openai_http.h"
 
 String llmAnswer(const String &question) {
-  // Build the payload with the JSON serializer so quotes, control characters
-  // and non-ASCII text in the transcription are escaped correctly.
+  // Serialize rather than hand-build the JSON, so quotes and non-ASCII text in
+  // the transcription are escaped correctly.
   JsonDocument request;
   request["model"] = LLM_MODEL;
   request["max_tokens"] = LLM_MAX_TOKENS;
@@ -30,14 +30,11 @@ String llmAnswer(const String &question) {
 
   JsonDocument doc;
   const DeserializationError err = deserializeJson(doc, response);
-  if (err) {
-    Serial.printf("LLM JSON parse error: %s\n", err.c_str());
-    return "";
-  }
-
-  const char *answer = doc["choices"][0]["message"]["content"];
+  const char *answer =
+      err ? nullptr : doc["choices"][0]["message"]["content"].as<const char *>();
   if (answer == nullptr) {
-    Serial.println("No 'choices[0].message.content' in the LLM response");
+    Serial.printf("LLM response unusable (%s)\n",
+                  err ? err.c_str() : "no choices[0].message.content");
     return "";
   }
   return String(answer);

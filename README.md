@@ -71,17 +71,18 @@ pio device monitor -b 115200
 Expected startup output: `WiFi connected, IP: ...`, `Audio buffer: N bytes
 (~M ms)`, `TTS buffer: N bytes (~30 s)`, then `Touch to speak` on the display.
 
-Each interaction logs:
+Each interaction logs the outcome of every stage:
 
 ```text
 [DIAG] speech=1 peakRMS=... samples=...
---- POST /v1/audio/transcriptions -> status 200 (N bytes) ---
 Transcript: <what you said>
---- POST /v1/chat/completions -> status 200 (N bytes) ---
 Answer: <the reply>
---- POST /v1/audio/speech -> status 200, N bytes downloaded ---
 Spoke N samples (~N ms)
 ```
+
+Failures log the request path and the HTTP status, for example
+`POST /v1/audio/speech failed (401)`. Successful requests are not logged, so the
+console stays readable.
 
 ## Notes and tuning
 

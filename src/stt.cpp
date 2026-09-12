@@ -12,9 +12,9 @@
 
 namespace {
 
-// Layout of the single buffer used for the upload:
+// The upload is one contiguous buffer, so the request can be posted with a
+// single HTTPClient call:
 //   [MULTIPART_HEAD][44 byte WAV header][PCM][MULTIPART_TAIL]
-// Keeping it contiguous lets the request be posted with one HTTPClient call.
 const char MULTIPART_HEAD[] =
     "--" WAV_BOUNDARY "\r\n"
     "Content-Disposition: form-data; name=\"model\"\r\n\r\n" TRANSCRIBE_MODEL "\r\n"
@@ -130,14 +130,9 @@ String sttTranscribe() {
 
   JsonDocument doc;
   const DeserializationError err = deserializeJson(doc, response);
-  if (err) {
-    Serial.printf("JSON parse error: %s\n", err.c_str());
-    return "";
-  }
-
-  const char *text = doc["text"];
+  const char *text = err ? nullptr : doc["text"].as<const char *>();
   if (text == nullptr) {
-    Serial.println("No 'text' field in JSON");
+    Serial.printf("STT response unusable (%s)\n", err ? err.c_str() : "no 'text' field");
     return "";
   }
   return String(text);

@@ -1,15 +1,8 @@
-// ---------------------------------------------------------------------------
-// Elecrow DLE06235B 3.5" ESP32-S3 voice assistant
+// Elecrow DLE06235B 3.5" ESP32-S3 voice assistant.
 //
-// Touch the screen to run one complete voice turn:
-//   1. STT     - record the spoken phrase and transcribe it.        (stt.*)
-//   2. LLM     - ask the chat model to answer the transcription.    (llm.*)
-//   3. TTS     - synthesize the answer and play it on the speaker.  (tts.*)
-//   4. Display - show the transcription and the answer on screen.   (display_ui.*)
-//
-// Shared helpers: app_config.h (settings), audio_io.* (I2S + ES8311 codec),
-// openai_http.* (HTTPS transport used by all three OpenAI calls).
-// ---------------------------------------------------------------------------
+// One voice turn per screen touch: STT -> LLM -> TTS, with the display
+// following along. Settings live in app_config.h, shared audio I/O in
+// audio_io.* and the HTTPS transport in openai_http.*.
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -28,18 +21,14 @@ namespace {
 void initWiFi() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(SSID, PASSWORD);
-  Serial.print("Connecting to WiFi");
-  for (int i = 0; i < 40 && WiFi.status() != WL_CONNECTED; i++) {
+  for (int i = 0; i < 40 && WiFi.status() != WL_CONNECTED; i++)
     delay(500);
-    Serial.print(".");
-  }
-  if (WiFi.status() == WL_CONNECTED)
-    Serial.printf("\nWiFi connected, IP: %s\n", WiFi.localIP().toString().c_str());
-  else
-    Serial.println("\nWiFi connection FAILED");
-}
 
-bool busy = false;
+  if (WiFi.status() == WL_CONNECTED)
+    Serial.printf("WiFi connected, IP: %s\n", WiFi.localIP().toString().c_str());
+  else
+    Serial.println("WiFi connection FAILED");
+}
 
 void fail(const String &message, uint32_t holdMs) {
   Serial.println(message);
@@ -47,9 +36,7 @@ void fail(const String &message, uint32_t holdMs) {
   delay(holdMs);
 }
 
-// ---------------------------------------------------------------------------
 // One voice turn: STT -> LLM -> TTS, with the display following along.
-// ---------------------------------------------------------------------------
 void runInteraction() {
   // 1. STT - capture the phrase, then upload it for transcription.
   uiConversation("Listening...", "", "");
@@ -81,15 +68,12 @@ void runInteraction() {
   uiConversation("Speaking...", question, answer);
   ttsSpeak(answer);
 
-  // 4. Display - keep the completed turn visible until the next activation.
+  // 4. Keep the completed turn visible until the next activation.
   uiConversation("Touch to speak", question, answer);
 }
 
 } // namespace
 
-// ---------------------------------------------------------------------------
-// setup / loop
-// ---------------------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
 
@@ -113,10 +97,7 @@ void loop() {
   const bool pressed = nowTouched && !prevTouched;
   prevTouched = nowTouched;
 
-  if (pressed && !busy) {
-    busy = true;
+  if (pressed)
     runInteraction();
-    busy = false;
-  }
   delay(5);
 }

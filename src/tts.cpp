@@ -76,7 +76,6 @@ bool ttsSpeak(const String &text) {
   request["voice"] = TTS_VOICE;
   request["input"] = text;
   request["response_format"] = "pcm"; // raw 24 kHz, 16-bit signed LE, mono
-  request["speed"] = 1.0;
 
   String payload;
   serializeJson(request, payload);
@@ -85,12 +84,10 @@ bool ttsSpeak(const String &text) {
   if (httpsPostToStream(TTS_PATH, payload, sink) != HTTP_OK_STATUS)
     return false;
 
-  if (sink.overflowed())
-    Serial.println("TTS audio truncated (buffer full)");
-  if (sink.size() < 2) {
-    Serial.println("TTS returned no audio");
+  if (sink.overflowed() || sink.size() < 2)
+    Serial.printf("TTS audio %s\n", sink.overflowed() ? "truncated (buffer full)" : "missing");
+  if (sink.size() < 2)
     return false;
-  }
 
   // Ignore a trailing odd byte so only whole 16-bit samples are played.
   const size_t samples = sink.size() / 2;
