@@ -12,7 +12,7 @@ namespace {
 // Collects a binary HTTP response body into a fixed buffer. It derives from
 // Stream because HTTPClient::writeToStream() expects a Stream.
 class BufferStream : public Stream {
-public:
+  public:
   BufferStream(uint8_t *buffer, size_t capacity) : buffer_(buffer), capacity_(capacity) {}
 
   size_t write(uint8_t byte) override { return write(&byte, 1); }
@@ -26,8 +26,6 @@ public:
     }
     if (copy < len)
       overflowed_ = true;
-    // Always report the full length: HTTPClient treats a short write as a
-    // failed transfer and aborts the download.
     return len;
   }
 
@@ -39,7 +37,7 @@ public:
   size_t size() const { return size_; }
   bool overflowed() const { return overflowed_; }
 
-private:
+  private:
   uint8_t *buffer_;
   size_t capacity_;
   size_t size_ = 0;

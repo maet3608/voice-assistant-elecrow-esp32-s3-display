@@ -2,10 +2,6 @@
 
 #include <Arduino.h>
 
-// ---------------------------------------------------------------------------
-// Speech-to-text: record the spoken phrase, upload it and return the text.
-// ---------------------------------------------------------------------------
-
 // Allocates the PSRAM buffer that holds the multipart transcription request
 // (head + WAV header + PCM + tail). Call once at boot.
 bool initStt();

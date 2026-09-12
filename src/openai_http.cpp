@@ -10,7 +10,7 @@ namespace {
 const char *g_apiKey = nullptr;
 
 // Creates the HTTPS client used for one request. TLS validation is disabled for
-// development; pin a CA certificate before shipping.
+// development
 bool beginRequest(HTTPClient &http, WiFiClientSecure &client, const char *path,
                   const char *contentType) {
   client.setInsecure();

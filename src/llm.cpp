@@ -6,8 +6,6 @@
 #include "openai_http.h"
 
 String llmAnswer(const String &question) {
-  // Serialize rather than hand-build the JSON, so quotes and non-ASCII text in
-  // the transcription are escaped correctly.
   JsonDocument request;
   request["model"] = LLM_MODEL;
   request["max_tokens"] = LLM_MAX_TOKENS;

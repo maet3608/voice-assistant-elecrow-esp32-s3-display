@@ -1,9 +1,3 @@
-// Elecrow DLE06235B 3.5" ESP32-S3 voice assistant.
-//
-// One voice turn per screen touch: STT -> LLM -> TTS, with the display
-// following along. Settings live in app_config.h, shared audio I/O in
-// audio_io.* and the HTTPS transport in openai_http.*.
-
 #include <Arduino.h>
 #include <WiFi.h>
 

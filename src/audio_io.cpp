@@ -2,7 +2,7 @@
 
 #include <math.h>
 
-#include "AudioTools.h" // vendored in lib/audio-tools (I2SStream)
+#include "AudioTools.h"
 #include "app_config.h"
 #include "es8311.h"
 
@@ -18,7 +18,7 @@ constexpr size_t CHUNK_FRAMES = 256;
 constexpr size_t CHUNK_BYTES = CHUNK_FRAMES * 4; // 2 channels x 2 bytes
 constexpr int DRAIN_BLOCKS = 4;                  // silence pushed after playback
 
-int16_t chunk[CHUNK_FRAMES * 2]; // scratch for one readMonoChunk() call
+int16_t chunk[CHUNK_FRAMES * 2];
 
 // Reads one chunk of stereo frames, downmixes it to mono and appends it to
 // `pcm`. Returns the RMS of the chunk (0 when nothing could be read).
@@ -42,7 +42,6 @@ float readMonoChunk(int16_t *pcm, size_t &samples, size_t maxSamples) {
 } // namespace
 
 bool initAudio() {
-  // Enable the speaker amplifier (see AMP_ENABLE_ACTIVE_LEVEL).
   pinMode(AMP_ENABLE_PIN, OUTPUT);
   digitalWrite(AMP_ENABLE_PIN, AMP_ENABLE_ACTIVE_LEVEL);
 
@@ -60,8 +59,6 @@ bool initAudio() {
   cfg.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
   cfg.buffer_count = 8;
   cfg.buffer_size = 256;
-  // Emit silence instead of replaying the last block on underrun, which would
-  // otherwise leave a short buzz on the speaker after playback ends.
   cfg.auto_clear = true;
 
   if (!i2sStream.begin(cfg)) {
@@ -69,7 +66,6 @@ bool initAudio() {
     return false;
   }
 
-  // Reuses I2C port 0 (GPIO38/39), already installed by the touch driver.
   if (es8311_codec_init() != ESP_OK) {
     Serial.println("ES8311 codec init failed");
     return false;

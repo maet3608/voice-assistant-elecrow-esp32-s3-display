@@ -2,8 +2,6 @@
 
 #include <Arduino.h>
 
-// Central configuration for the Elecrow DLE06235B 3.5" ESP32-S3 voice assistant.
-
 // --- I2S / ES8311 codec (capture and playback share this bus) ----------------
 // These names must not collide with audio-tools' default PIN_I2S_* macros.
 constexpr int I2S_BCK_PIN = 18;
@@ -13,8 +11,6 @@ constexpr int I2S_DOUT_PIN = 15; // ESP32 -> codec (speaker / DAC data)
 constexpr int I2S_MCK_PIN = 17;
 constexpr int I2S_PORT_NO = 1; // I2S_NUM_1
 
-// lib/ES8311 brings the codec up at this rate with a 384x MCLK multiple, so
-// playback audio must be resampled to it (see playPcmMono).
 constexpr int SAMPLE_RATE = 16000;
 
 constexpr int AMP_ENABLE_PIN = 1;

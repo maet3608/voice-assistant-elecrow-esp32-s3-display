@@ -15,8 +15,7 @@ ST77922_TOUCH touch;
 
 // Layout for rotation 0 (320x480). The Latin-1 GFX font replaces TFT_eSPI's
 // built-in font 4, which only contains ASCII 0x20-0x7F and therefore silently
-// drops accented characters such as u-umlaut or sharp-s. Its line advance is
-// exposed as Latin1Font24_YADVANCE by the generated header.
+// drops accented characters such as u-umlaut or sharp-s.
 constexpr int MARGIN = 10;
 constexpr int TEXT_SIZE = 1;
 
