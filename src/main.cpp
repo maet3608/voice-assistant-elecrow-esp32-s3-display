@@ -3,8 +3,10 @@
 // Touch the screen to record a spoken phrase. The audio is transcribed with
 // OpenAI and the result is displayed on screen.
 //   - Display/touch initialization is unchanged from the original project.
-//   - Audio is captured from the ES8311 codec microphone over I2S.
+//   - Audio capture uses the audio-tools I2SStream on top of the ES8311 codec.
 //   - Simple energy-based voice activity detection (VAD) ends the recording.
+//   - The WAV header and the multipart body are assembled in a single buffer
+//     and posted with HTTPClient.
 // ---------------------------------------------------------------------------
 
 #include "ST77922.h"
@@ -13,15 +15,17 @@
 #include <TFT_eSPI.h>
 
 #include <ArduinoJson.h>
+#include <HTTPClient.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
-#include <driver/i2s.h>
-#include <esp32-hal-psram.h>
-#include <freertos/FreeRTOS.h>
+#include <esp_heap_caps.h>
 #include <math.h>
 
+#include "AudioTools.h" // vendored in lib/audio-tools (I2SStream)
 #include "credentials.h"
 #include "es8311.h"
+
+using namespace audio_tools;
 
 // ---------------------------------------------------------------------------
 // Display & touch (initialization kept as-is)
@@ -57,29 +61,55 @@ void initTouch() {
 }
 
 // ---------------------------------------------------------------------------
-// Audio capture configuration (ES8311 codec + I2S)
+// Audio capture configuration (ES8311 codec + I2S via audio-tools)
 // ---------------------------------------------------------------------------
-#define PIN_I2S_BCK 18
-#define PIN_I2S_WS 21
-#define PIN_I2S_DIN 16  // codec -> ESP32 (microphone data)
-#define PIN_I2S_DOUT 15 // ESP32 -> codec (unused for capture)
-#define PIN_I2S_MCK 17
+// Note: these names must not collide with audio-tools' default PIN_I2S_* macros.
+constexpr int I2S_BCK_PIN = 18;
+constexpr int I2S_WS_PIN = 21;
+constexpr int I2S_DIN_PIN = 16;  // codec -> ESP32 (microphone data)
+constexpr int I2S_DOUT_PIN = 15; // ESP32 -> codec (unused for capture)
+constexpr int I2S_MCK_PIN = 17;
+constexpr int I2S_PORT_NO = 1;   // I2S_NUM_1
 
-#define SAMPLE_RATE 16000
-#define MAX_RECORD_SECS 12
-#define NO_SPEECH_TIMEOUT_MS 6000 // give up if nothing is spoken
-#define SILENCE_TIMEOUT_MS 1300   // stop after this much trailing silence
-#define SILENCE_PAD_MS 350        // keep a little audio after last speech
-#define VAD_THRESHOLD 600.0f      // RMS of 16-bit samples counted as speech
+constexpr int SAMPLE_RATE = 16000;
+constexpr int MAX_RECORD_SECS = 12;
+constexpr uint32_t NO_SPEECH_TIMEOUT_MS = 6000; // give up if nothing is spoken
+constexpr uint32_t SILENCE_TIMEOUT_MS = 1300;   // stop after this much trailing silence
+constexpr uint32_t SILENCE_PAD_MS = 350;        // keep a little audio after last speech
+constexpr float VAD_THRESHOLD = 600.0f;         // RMS of 16-bit samples counted as speech
 
 #define TRANSCRIBE_MODEL "gpt-4o-transcribe"
+#define WAV_BOUNDARY "----ESP32Boundary7MA4YWxk"
 
-// I2S is driven with the legacy API (driver/i2s.h); no channel handles needed.
+constexpr const char *OPENAI_HOST = "api.openai.com";
+constexpr uint16_t OPENAI_PORT = 443;
+constexpr const char *TRANSCRIBE_PATH = "/v1/audio/transcriptions";
 
-// 44-byte WAV header + mono 16-bit PCM (PSRAM with internal-RAM fallback).
-static uint8_t *wavBuf = nullptr;
-static size_t pcmBufBytes = 0; // usable PCM bytes, determined at init
-static const size_t MAX_PCM_BYTES = SAMPLE_RATE * 2 * MAX_RECORD_SECS;
+I2SStream i2sStream;
+
+// ---------------------------------------------------------------------------
+// The multipart request body is built in a single buffer so it can be posted
+// with one HTTPClient::POST() call. Layout:
+//   [MULTIPART_HEAD][44 byte WAV header][PCM][MULTIPART_TAIL]
+// ---------------------------------------------------------------------------
+static const char MULTIPART_HEAD[] =
+    "--" WAV_BOUNDARY "\r\n"
+    "Content-Disposition: form-data; name=\"model\"\r\n\r\n"
+    TRANSCRIBE_MODEL "\r\n"
+    "--" WAV_BOUNDARY "\r\n"
+    "Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n"
+    "Content-Type: audio/wav\r\n\r\n";
+static const char MULTIPART_TAIL[] = "\r\n--" WAV_BOUNDARY "--\r\n";
+
+constexpr size_t WAV_HEADER_LEN = 44;
+constexpr size_t HEAD_LEN = sizeof(MULTIPART_HEAD) - 1;
+constexpr size_t TAIL_LEN = sizeof(MULTIPART_TAIL) - 1;
+constexpr size_t MAX_PCM_BYTES = SAMPLE_RATE * 2 * MAX_RECORD_SECS;
+constexpr size_t MIN_PCM_BYTES = SAMPLE_RATE * 2 * 2; // fallback: ~2 s of audio
+
+static uint8_t *reqBuf = nullptr;  // head + WAV header + PCM + tail
+static uint8_t *pcmArea = nullptr; // reqBuf + HEAD_LEN + WAV_HEADER_LEN
+static size_t pcmBufBytes = 0;     // usable PCM bytes, determined at init
 
 // ---------------------------------------------------------------------------
 // WiFi
@@ -99,175 +129,150 @@ void initWiFi() {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Audio init: I2S bus + ES8311 codec
-// ---------------------------------------------------------------------------
-void initAudio() {
-  i2s_config_t cfg = {
-      .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX | I2S_MODE_RX),
-      .sample_rate = SAMPLE_RATE,
-      .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-      .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
-      .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-      .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-      .dma_buf_count = 8,
-      .dma_buf_len = 256,
-      .use_apll = false,
-      .tx_desc_auto_clear = false,
-      .fixed_mclk = 0,
-      .mclk_multiple = I2S_MCLK_MULTIPLE_384,
-  };
-
-  i2s_pin_config_t pins = {
-      .mck_io_num = PIN_I2S_MCK,
-      .bck_io_num = PIN_I2S_BCK,
-      .ws_io_num = PIN_I2S_WS,
-      .data_out_num = PIN_I2S_DOUT,
-      .data_in_num = PIN_I2S_DIN,
-  };
-
-  esp_err_t err = i2s_driver_install(I2S_NUM_1, &cfg, 0, NULL);
-  if (err != ESP_OK) {
-    Serial.printf("i2s_driver_install failed: %s\n", esp_err_to_name(err));
-    return;
+// Prefer PSRAM, fall back to internal RAM and to a smaller buffer.
+static uint8_t *allocRequestBuffer(size_t &bytes) {
+  const size_t minBytes = HEAD_LEN + WAV_HEADER_LEN + MIN_PCM_BYTES + TAIL_LEN;
+  while (bytes >= minBytes) {
+    uint8_t *buf = (uint8_t *)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (buf == nullptr)
+      buf = (uint8_t *)malloc(bytes);
+    if (buf != nullptr)
+      return buf;
+    bytes /= 2;
   }
-  err = i2s_set_pin(I2S_NUM_1, &pins);
-  if (err != ESP_OK) {
-    Serial.printf("i2s_set_pin failed: %s\n", esp_err_to_name(err));
-    return;
+  return nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// Audio init: I2S bus (audio-tools) + ES8311 codec + request buffer
+// ---------------------------------------------------------------------------
+bool initAudio() {
+  auto cfg = i2sStream.defaultConfig(RXTX_MODE);
+  cfg.port_no = I2S_PORT_NO;
+  cfg.is_master = true;
+  cfg.pin_mck = I2S_MCK_PIN;
+  cfg.pin_bck = I2S_BCK_PIN;
+  cfg.pin_ws = I2S_WS_PIN;
+  cfg.pin_data = I2S_DOUT_PIN;
+  cfg.pin_data_rx = I2S_DIN_PIN;
+  cfg.sample_rate = SAMPLE_RATE;
+  cfg.bits_per_sample = 16;
+  cfg.channels = 2;
+  cfg.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
+  cfg.buffer_count = 8;
+  cfg.buffer_size = 256;
+  cfg.auto_clear = false;
+
+  if (!i2sStream.begin(cfg)) {
+    Serial.println("I2S driver init failed");
+    return false;
   }
 
   // Reuses I2C port 0 (GPIO38/39), already installed by the touch driver.
   if (es8311_codec_init() != ESP_OK) {
     Serial.println("ES8311 codec init failed");
-    return;
+    return false;
   }
 
-  Serial.printf("PSRAM: found=%d size=%d free=%d\n",
-                psramFound(), ESP.getPsramSize(), ESP.getFreePsram());
-  Serial.printf("Heap: free=%d maxAlloc=%d\n", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
-
-  // Prefer PSRAM, fall back to internal RAM, shrink if necessary.
-  size_t want = 44 + MAX_PCM_BYTES;
-  wavBuf = psramFound() ? (uint8_t *)ps_malloc(want) : nullptr;
-  if (!wavBuf)
-    wavBuf = (uint8_t *)malloc(want);
-  while (!wavBuf && want > (44 + 8000)) { // down to ~0.25 s of audio
-    want /= 2;
-    wavBuf = psramFound() ? (uint8_t *)ps_malloc(want) : nullptr;
-    if (!wavBuf)
-      wavBuf = (uint8_t *)malloc(want);
-  }
-  if (!wavBuf) {
+  size_t want = HEAD_LEN + WAV_HEADER_LEN + MAX_PCM_BYTES + TAIL_LEN;
+  reqBuf = allocRequestBuffer(want);
+  if (reqBuf == nullptr) {
     Serial.println("Failed to allocate audio buffer");
-    return;
+    return false;
   }
-  pcmBufBytes = want - 44;
+  pcmArea = reqBuf + HEAD_LEN + WAV_HEADER_LEN;
+  pcmBufBytes = want - HEAD_LEN - WAV_HEADER_LEN - TAIL_LEN;
   Serial.printf("Audio buffer: %u bytes (~%u ms)\n", (unsigned)pcmBufBytes,
                 (unsigned)(pcmBufBytes / 2 * 1000 / SAMPLE_RATE));
-}
-
-// ---------------------------------------------------------------------------
-// One-shot audio diagnostic (prints I2S RX status + per-channel RMS)
-// ---------------------------------------------------------------------------
-void audioDiag() {
-  int16_t chunk[512];
-  size_t bytesRead = 0;
-  esp_err_t err = i2s_read(I2S_NUM_1, chunk, sizeof(chunk), &bytesRead, pdMS_TO_TICKS(200));
-  int nFrames = (int)(bytesRead / 4);
-  int64_t sumA = 0, sumB = 0;
-  for (int i = 0; i < nFrames; i++) {
-    int16_t a = chunk[i * 2];
-    int16_t b = chunk[i * 2 + 1];
-    sumA += (int64_t)a * a;
-    sumB += (int64_t)b * b;
-  }
-  Serial.printf("[DIAG] i2s err=%d bytes=%d frames=%d\n", (int)err, (int)bytesRead, nFrames);
-  if (nFrames > 0) {
-    Serial.printf("[DIAG] chA RMS=%d  chB RMS=%d\n",
-                  (int)sqrtf((float)sumA / nFrames), (int)sqrtf((float)sumB / nFrames));
-    Serial.print("[DIAG] first samples:");
-    for (int i = 0; i < 16; i++)
-      Serial.printf(" %d", chunk[i]);
-    Serial.println();
-  }
+  return true;
 }
 
 // ---------------------------------------------------------------------------
 // WAV header (44-byte PCM header)
 // ---------------------------------------------------------------------------
-void writeWavHeader(uint8_t *buf, uint32_t dataBytes) {
-  const uint32_t sampleRate = SAMPLE_RATE;
-  const uint16_t channels = 1;
-  const uint16_t bitsPerSample = 16;
-  const uint32_t byteRate = sampleRate * channels * (bitsPerSample / 8);
-  const uint16_t blockAlign = channels * (bitsPerSample / 8);
+#pragma pack(push, 1)
+struct WavHeader {
+  char riff[4];
+  uint32_t riffSize;
+  char wave[4];
+  char fmt[4];
+  uint32_t fmtSize;
+  uint16_t audioFormat;
+  uint16_t channels;
+  uint32_t sampleRate;
+  uint32_t byteRate;
+  uint16_t blockAlign;
+  uint16_t bitsPerSample;
+  char data[4];
+  uint32_t dataSize;
+};
+#pragma pack(pop)
+static_assert(sizeof(WavHeader) == WAV_HEADER_LEN, "WAV header must be 44 bytes");
 
-  memcpy(buf + 0, "RIFF", 4);
-  uint32_t riffSize = 36 + dataBytes;
-  memcpy(buf + 4, &riffSize, 4);
-  memcpy(buf + 8, "WAVE", 4);
-  memcpy(buf + 12, "fmt ", 4);
-  uint32_t fmtSize = 16;
-  memcpy(buf + 16, &fmtSize, 4);
-  uint16_t audioFormat = 1; // PCM
-  memcpy(buf + 20, &audioFormat, 2);
-  memcpy(buf + 22, &channels, 2);
-  memcpy(buf + 24, &sampleRate, 4);
-  memcpy(buf + 28, &byteRate, 4);
-  memcpy(buf + 32, &blockAlign, 2);
-  memcpy(buf + 34, &bitsPerSample, 2);
-  memcpy(buf + 36, "data", 4);
-  memcpy(buf + 40, &dataBytes, 4);
+void writeWavHeader(uint8_t *buf, uint32_t dataBytes) {
+  WavHeader h = {};
+  memcpy(h.riff, "RIFF", 4);
+  h.riffSize = 36 + dataBytes;
+  memcpy(h.wave, "WAVE", 4);
+  memcpy(h.fmt, "fmt ", 4);
+  h.fmtSize = 16;
+  h.audioFormat = 1; // PCM
+  h.channels = 1;
+  h.sampleRate = SAMPLE_RATE;
+  h.bitsPerSample = 16;
+  h.blockAlign = h.channels * (h.bitsPerSample / 8);
+  h.byteRate = h.sampleRate * h.blockAlign;
+  memcpy(h.data, "data", 4);
+  h.dataSize = dataBytes;
+  memcpy(buf, &h, sizeof(h));
+}
+
+// ---------------------------------------------------------------------------
+// Reads one chunk of stereo frames, downmixes it to mono and appends it to the
+// PCM area. Returns the RMS of the chunk (0 when nothing could be read).
+// ---------------------------------------------------------------------------
+float readMonoChunk(size_t &pcmBytes, int16_t *chunk, size_t frames) {
+  size_t bytesRead = i2sStream.readBytes((uint8_t *)chunk, frames * 4);
+  const int nFrames = (int)(bytesRead / 4); // 2 channels x 2 bytes
+  int64_t sumSq = 0;
+  for (int i = 0; i < nFrames; i++) {
+    // Sum both channels so we don't depend on the mono mic's L/R position.
+    int32_t s = (int32_t)chunk[i * 2] + chunk[i * 2 + 1];
+    if (s > 32767)
+      s = 32767;
+    if (s < -32768)
+      s = -32768;
+    int16_t mono = (int16_t)s;
+    if (pcmBytes + 2 <= pcmBufBytes) {
+      pcmArea[pcmBytes++] = (uint8_t)(mono & 0xFF);
+      pcmArea[pcmBytes++] = (uint8_t)((mono >> 8) & 0xFF);
+    }
+    sumSq += (int64_t)mono * mono;
+  }
+  return (nFrames > 0) ? sqrtf((float)sumSq / (float)nFrames) : 0.0f;
 }
 
 // ---------------------------------------------------------------------------
 // Recording with simple energy-based voice activity detection (VAD).
-// Captures mono 16-bit PCM from the I2S left channel into wavBuf (after the
-// header) and returns the total WAV size (header + PCM), or 0 if no speech.
+// Captures mono 16-bit PCM into the request buffer and completes the multipart
+// body. Returns the total request body size, or 0 if no speech was detected.
 // ---------------------------------------------------------------------------
 size_t recordSpeech() {
-  if (!wavBuf || pcmBufBytes == 0)
+  if (reqBuf == nullptr || pcmBufBytes == 0)
     return 0;
-  uint8_t *pcm = wavBuf + 44;
+
   int16_t chunk[512]; // 256 stereo frames
   size_t pcmBytes = 0;
   bool speech = false;
   size_t lastVoiceSample = 0;
-  uint32_t startMs = millis();
   float peakRms = 0;
+  const uint32_t startMs = millis();
 
   // Flush stale DMA data before capturing.
-  size_t flushed = 0;
-  i2s_read(I2S_NUM_1, chunk, sizeof(chunk), &flushed, pdMS_TO_TICKS(20));
+  i2sStream.readBytes((uint8_t *)chunk, sizeof(chunk));
 
   while (true) {
-    size_t bytesRead = 0;
-    esp_err_t err = i2s_read(I2S_NUM_1, chunk, sizeof(chunk), &bytesRead, pdMS_TO_TICKS(100));
-    if (err == ESP_ERR_TIMEOUT) {
-      bytesRead = 0; // treat a read timeout as a silent frame
-    } else if (err != ESP_OK) {
-      break;
-    }
-
-    int nFrames = (int)(bytesRead / 4); // 2 channels x 2 bytes
-    int64_t sumSq = 0;
-    for (int i = 0; i < nFrames; i++) {
-      // Sum both channels so we don't depend on the mono mic's L/R position.
-      int32_t s = (int32_t)chunk[i * 2] + chunk[i * 2 + 1];
-      if (s > 32767)
-        s = 32767;
-      if (s < -32768)
-        s = -32768;
-      int16_t mono = (int16_t)s;
-      if (pcmBytes + 2 <= pcmBufBytes) {
-        pcm[pcmBytes++] = (uint8_t)(mono & 0xFF);
-        pcm[pcmBytes++] = (uint8_t)((mono >> 8) & 0xFF);
-      }
-      sumSq += (int64_t)mono * mono;
-    }
-
-    float rms = (nFrames > 0) ? sqrtf((float)sumSq / (float)nFrames) : 0.0f;
+    const float rms = readMonoChunk(pcmBytes, chunk, 256);
     if (rms > peakRms)
       peakRms = rms;
     if (rms > VAD_THRESHOLD) {
@@ -275,16 +280,10 @@ size_t recordSpeech() {
       lastVoiceSample = pcmBytes / 2;
     }
 
-    uint32_t elapsed = millis() - startMs;
-    size_t silenceSamples = (pcmBytes / 2) - lastVoiceSample;
-
-    if (speech && (silenceSamples * 1000 / SAMPLE_RATE) >= SILENCE_TIMEOUT_MS)
-      break;
-    if (!speech && elapsed > NO_SPEECH_TIMEOUT_MS)
-      break;
-    if (elapsed > (uint32_t)(MAX_RECORD_SECS * 1000))
-      break;
-    if (pcmBytes >= pcmBufBytes)
+    const uint32_t elapsedMs = millis() - startMs;
+    const uint32_t silenceMs = (uint32_t)((pcmBytes / 2 - lastVoiceSample) * 1000 / SAMPLE_RATE);
+    const bool timedOut = speech ? (silenceMs >= SILENCE_TIMEOUT_MS) : (elapsedMs > NO_SPEECH_TIMEOUT_MS);
+    if (timedOut || elapsedMs > (uint32_t)(MAX_RECORD_SECS * 1000) || pcmBytes >= pcmBufBytes)
       break;
   }
 
@@ -294,101 +293,55 @@ size_t recordSpeech() {
     return 0;
 
   // Trim trailing silence, keeping a little padding after the last loud sample.
-  size_t padSamples = (size_t)(SAMPLE_RATE * SILENCE_PAD_MS / 1000);
-  size_t endSample = lastVoiceSample + padSamples;
-  size_t totalSamples = pcmBytes / 2;
+  const size_t totalSamples = pcmBytes / 2;
+  size_t endSample = lastVoiceSample + (size_t)(SAMPLE_RATE * SILENCE_PAD_MS / 1000);
   if (endSample > totalSamples)
     endSample = totalSamples;
 
-  uint32_t dataBytes = (uint32_t)(endSample * 2);
-  writeWavHeader(wavBuf, dataBytes);
-  return 44 + dataBytes;
+  const uint32_t dataBytes = (uint32_t)(endSample * 2);
+  writeWavHeader(reqBuf + HEAD_LEN, dataBytes);
+  memcpy(reqBuf, MULTIPART_HEAD, HEAD_LEN);
+  memcpy(reqBuf + HEAD_LEN + WAV_HEADER_LEN + dataBytes, MULTIPART_TAIL, TAIL_LEN);
+  return HEAD_LEN + WAV_HEADER_LEN + dataBytes + TAIL_LEN;
 }
 
 // ---------------------------------------------------------------------------
 // OpenAI transcription: multipart POST to /v1/audio/transcriptions
 // ---------------------------------------------------------------------------
-String transcribeAudio(const uint8_t *wav, size_t wavSize) {
-  const char *host = "api.openai.com";
-  const uint16_t port = 443;
-  const String boundary = "----ESP32Boundary7MA4YWxk";
-
+int postMultipart(const uint8_t *body, size_t len, String &responseBody) {
   WiFiClientSecure client;
   client.setInsecure(); // Development only; pin a CA certificate for production.
   client.setTimeout(20000);
 
-  if (!client.connect(host, port)) {
+  HTTPClient http;
+  http.setTimeout(30000);
+  http.setReuse(false); // single request: send "Connection: close" (as before)
+  if (!http.begin(client, OPENAI_HOST, OPENAI_PORT, TRANSCRIBE_PATH, true)) {
     Serial.println("TLS connection to OpenAI failed");
-    return "";
+    return -1;
   }
 
-  String head;
-  head += "--" + boundary + "\r\n";
-  head += "Content-Disposition: form-data; name=\"model\"\r\n\r\n";
-  head += String(TRANSCRIBE_MODEL) + "\r\n";
-  head += "--" + boundary + "\r\n";
-  head += "Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n";
-  head += "Content-Type: audio/wav\r\n\r\n";
-  String tail = "\r\n--" + boundary + "--\r\n";
+  http.addHeader("Authorization", String("Bearer ") + OPENAI_API_KEY);
+  http.addHeader("Content-Type", String("multipart/form-data; boundary=") + WAV_BOUNDARY);
 
-  size_t contentLength = head.length() + wavSize + tail.length();
+  const int status = http.POST(const_cast<uint8_t *>(body), len);
+  if (status == HTTP_CODE_OK)
+    responseBody = http.getString();
+  http.end();
 
-  client.print("POST /v1/audio/transcriptions HTTP/1.1\r\n");
-  client.print("Host: api.openai.com\r\n");
-  client.print("Authorization: Bearer ");
-  client.print(OPENAI_API_KEY);
-  client.print("\r\n");
-  client.print("Content-Type: multipart/form-data; boundary=");
-  client.print(boundary);
-  client.print("\r\n");
-  client.print("Content-Length: ");
-  client.print((uint32_t)contentLength);
-  client.print("\r\n");
-  client.print("Connection: close\r\n\r\n");
-
-  client.print(head);
-  size_t written = 0;
-  while (written < wavSize) {
-    size_t n = client.write(wav + written, wavSize - written);
-    if (n == 0)
-      break;
-    written += n;
-  }
-  client.print(tail);
-
-  String response;
-  unsigned long deadline = millis() + 30000;
-  while (millis() < deadline) {
-    while (client.available()) {
-      char c = (char)client.read();
-      if (response.length() < 8192)
-        response += c;
-    }
-    if (!client.connected() && !client.available())
-      break;
-    delay(5);
-  }
-  client.stop();
-
-  Serial.println("--- OpenAI response ---");
-  Serial.println(response);
-  return response;
+  Serial.printf("--- OpenAI response (status %d, %u bytes) ---\n", status,
+                (unsigned)responseBody.length());
+  Serial.println(responseBody);
+  return status;
 }
 
-// ---------------------------------------------------------------------------
-// Robust JSON parsing: locate the JSON object (the response may be prefixed),
-// then read the "text" field.
-// ---------------------------------------------------------------------------
-String extractTranscript(const String &response) {
-  int jsonStart = response.indexOf('{');
-  int jsonEnd = response.lastIndexOf('}');
-  if (jsonStart < 0 || jsonEnd <= jsonStart) {
-    Serial.println("No JSON object found in response");
+String transcribeAudio(const uint8_t *body, size_t len) {
+  String response;
+  if (postMultipart(body, len, response) != HTTP_CODE_OK)
     return "";
-  }
 
   JsonDocument doc;
-  DeserializationError err = deserializeJson(doc, response.substring(jsonStart, jsonEnd + 1));
+  DeserializationError err = deserializeJson(doc, response);
   if (err) {
     Serial.printf("JSON parse error: %s\n", err.c_str());
     return "";
@@ -462,15 +415,15 @@ void showTranscript(const String &text) {
 bool busy = false;
 
 void runInteraction() {
-  if (!wavBuf || pcmBufBytes == 0) {
+  if (reqBuf == nullptr || pcmBufBytes == 0) {
     showMessage("Audio not ready");
     delay(1500);
     return;
   }
 
   showMessage("Listening...");
-  size_t wavSize = recordSpeech();
-  if (wavSize == 0) {
+  const size_t bodyLen = recordSpeech();
+  if (bodyLen == 0) {
     Serial.println("No speech detected");
     showMessage("No speech detected");
     delay(1200);
@@ -478,8 +431,7 @@ void runInteraction() {
   }
 
   showMessage("Transcribing...");
-  String response = transcribeAudio(wavBuf, wavSize);
-  String text = extractTranscript(response);
+  String text = transcribeAudio(reqBuf, bodyLen);
   if (text.isEmpty()) {
     Serial.println("Transcription failed");
     showMessage("Transcription failed");
@@ -503,11 +455,11 @@ void setup() {
   initTouch();
 
   initWiFi();
-  initAudio();
-  audioDiag();
 
-  if (WiFi.status() == WL_CONNECTED) {
-    showMessage("Touch to speak 1");
+  if (!initAudio()) {
+    showMessage("Audio not ready");
+  } else if (WiFi.status() == WL_CONNECTED) {
+    showMessage("Touch to speak");
   } else {
     showMessage("WiFi offline");
   }
