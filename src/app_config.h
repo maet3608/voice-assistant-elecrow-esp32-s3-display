@@ -31,7 +31,7 @@ constexpr float VAD_THRESHOLD = 600.0f;         // RMS of 16-bit samples counted
   "You are a helpful voice assistant on a small embedded display. " \
   "Answer concisely in at most 60 words using plain prose."
 constexpr int LLM_MAX_TOKENS = 160;
-constexpr float LLM_TEMPERATURE = 0.7f;
+constexpr float LLM_TEMPERATURE = 0.0f;
 
 // --- Text-to-speech: speak the answer on the loudspeaker --------------------
 #define TTS_MODEL "gpt-4o-mini-tts"
