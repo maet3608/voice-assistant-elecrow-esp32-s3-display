@@ -8,7 +8,7 @@
 // the capacitive touch controller.
 void initDisplayUi();
 
-// Raw touch state (true while the panel is pressed).
+// Raw touch state.
 bool readTouch();
 
 // Full-screen transient message (boot status, Wi-Fi problems, fatal errors).
