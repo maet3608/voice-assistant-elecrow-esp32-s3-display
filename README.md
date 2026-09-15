@@ -1,5 +1,15 @@
 # Elecrow ESP32-S3 AI Voice Assistant
 
+
+This software is for an AI voice assistant that runs on a Elecrow 3.5 inch ESP32-S3 display board. 
+
+The assistant will be activated by touching the screen. You can then ask a question out loud, 
+it gest transcribed and answered by an OpenAI chat model. Question and answer are displayed 
+and the board also speaks the answer through a small loudspeaker.
+
+
+## Requirements
+
 > **Before you build:** you must create `include/credentials.h` yourself with
 > valid constant values (your Wi-Fi SSID/password and an OpenAI API key). It is
 > intentionally **not committed** and the firmware will not compile without it.
