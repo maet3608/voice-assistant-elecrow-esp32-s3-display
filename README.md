@@ -7,6 +7,9 @@ The assistant will be activated by touching the screen. You can then ask a quest
 it gest transcribed and answered by an OpenAI chat model. Question and answer are displayed 
 and the board also speaks the answer through a small loudspeaker.
 
+For more information see the [AI Voice Assistant Using the Elecrow 3.5 Inch ESP32-S3 Display](https://www.makerguides.com/ai-voice-assistant-using-the-elecrow-3-5-inch-esp32-s3-display/)
+tutorial.
+
 
 ## Requirements
 
@@ -17,6 +20,8 @@ and the board also speaks the answer through a small loudspeaker.
 > exact contents. Everything else is configured in `src/app_config.h`, the main
 > configuration file for the firmware.
 
+## Function
+
 Touch the screen to run one complete voice turn:
 
 1. **STT** – record the spoken phrase with the onboard microphone and transcribe
@@ -25,6 +30,7 @@ Touch the screen to run one complete voice turn:
 3. **TTS** – synthesize the answer with the OpenAI speech API and play it on the
    onboard speaker.
 4. **Display** – show the transcription and the answer on the 320x480 display.
+
 
 ## Source layout
 
@@ -38,6 +44,7 @@ Touch the screen to run one complete voice turn:
 | `src/stt.*` | WAV/multipart upload and transcript parsing |
 | `src/llm.*` | Chat completion request/response |
 | `src/tts.*` | Speech synthesis and speaker playback |
+
 
 ## Configuration
 
@@ -70,6 +77,7 @@ const char *OPENAI_API_KEY = "sk-proj-...";
 - LLM/TTS model names, the system prompt, and token/temperature limits
 - OpenAI host and endpoint paths
 
+
 ## Build and upload
 
 ```bat
@@ -78,26 +86,3 @@ pio run -e elecrow-esp32-s3 -t upload
 pio device monitor -b 115200
 ```
 
-Expected startup output: `WiFi connected, IP: ...`, `Audio buffer: N bytes
-(~M ms)`, `TTS buffer: N bytes (~30 s)`, then `Touch to speak` on the display.
-
-Each interaction logs the outcome of every stage:
-
-```text
-[DIAG] speech=1 peakRMS=... samples=...
-Transcript: <what you said>
-Answer: <the reply>
-Spoke N samples (~N ms)
-```
-
-Failures log the request path and the HTTP status, for example
-`POST /v1/audio/speech failed (401)`. Successful requests are not logged, so the
-console stays readable.
-
-## Notes and tuning
-
-- The ES8311 codec is brought up at 16 kHz by `lib/ES8311`, so the synthesized
-  24 kHz PCM returned by OpenAI is resampled to 16 kHz in `audio_io.cpp` before
-  playback.
-- TLS certificate validation is disabled (`setInsecure()`) for development.
-- Speech is captured only after a touch; audio is never written to storage.
